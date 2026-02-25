@@ -1,0 +1,413 @@
+---
+title: "Ensemble Methods for Sales Prediction"
+subtitle: "Bagging, Random Forests, Gradient Boosting, Elastic Net & Model Stacking on the Carseats Dataset"
+author: "Saroj Bhatta"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-title: "Contents"
+    theme: cosmo
+    highlight-style: github
+    code-fold: false
+    code-tools: true
+    df-print: kable
+    fig-width: 7
+    fig-height: 5
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Overview
+
+Ensemble methods combine multiple models to produce predictions that are typically more accurate and robust than any individual model. This report compares four approaches — **bagged decision trees**, **random forests**, **gradient boosted trees**, and **elastic net** — for predicting car seat `Sales` from 10 retail and product attributes. A **stacked ensemble** (model stacking) is then constructed to combine all four into a single optimized predictor.
+
+---
+
+## Setup
+
+```{r}
+#| label: load-packages
+
+library(tidyverse)
+library(tidymodels)
+library(ISLR)
+library(visdat)
+library(stacks)
+```
+
+---
+
+## Dataset Overview
+
+The `Carseats` dataset from the ISLR package contains **400 observations** and **11 variables** simulating car seat sales at retail locations. The prediction target is `Sales` (unit sales in thousands).
+
+```{r}
+#| label: fig-visdat
+#| fig-cap: "Variable types in the Carseats dataset: 8 numeric and 3 factor variables."
+
+vis_dat(Carseats) +
+  theme(axis.text.x = element_text(hjust = 0.5))
+```
+
+```{r}
+#| label: fig-vismiss
+#| fig-cap: "Missing data check — 0% missing values across all variables."
+
+vis_miss(Carseats) +
+  theme(axis.text.x = element_text(hjust = 0.5))
+```
+
+```{r}
+#| label: data-structure
+
+str(Carseats)
+dim(Carseats)
+```
+
+There are **11 variables**: `Sales`, `CompPrice`, `Income`, `Advertising`, `Population`, `Price`, `ShelveLoc`, `Age`, `Education`, `Urban`, and `US`. The factor variables `ShelveLoc`, `Urban`, and `US` will be dummy-encoded during preprocessing. There are **no missing values**.
+
+---
+
+## Outcome Distribution
+
+```{r}
+#| label: fig-sales-dist
+#| fig-cap: "Distribution of car seat Sales (thousands of units). The distribution is approximately bell-shaped, centered around 7–8 thousand units."
+
+ggplot(data = Carseats, aes(x = Sales)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 30,
+                 color = 'black', fill = 'skyblue') +
+  geom_density(alpha = 0.5, fill = 'blue') +
+  labs(
+    title = "Distribution of Sales",
+    x = "Sales (thousands of units)",
+    y = "Density"
+  )
+```
+
+---
+
+## Preprocessing Recipe & Shared Workflow
+
+A single recipe is applied to all models. Dummy encoding handles the three factor variables; normalization ensures comparability across tree-based methods and elastic net (which is sensitive to predictor scale).
+
+```{r}
+#| label: recipe-workflow
+
+sales_rec <- recipe(Sales ~ ., data = Carseats) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_normalize(all_predictors())
+
+base_wf <- workflow() |> add_recipe(sales_rec)
+```
+
+### Cross-Validation Setup
+
+5-fold CV is used to tune all models. The `control_resamples()` object with `save_pred = TRUE` and `save_workflow = TRUE` enables model stacking later — the stacks package requires access to held-out predictions from each candidate model.
+
+```{r}
+#| label: cv-setup
+
+set.seed(7)
+carseats_folds <- vfold_cv(Carseats, v = 5)
+
+# Required for stacking: saves predictions and workflows from each fold
+ctrl <- tune::control_resamples(
+  save_pred     = TRUE,
+  save_workflow = TRUE
+)
+
+# Tree count grid shared across all tree-based models
+trees_grid <- expand_grid(trees = c(10, 25, 50, 100, 200, 300))
+```
+
+---
+
+## Model 1: Bagged Decision Trees
+
+**Bagging** (Bootstrap Aggregating) reduces variance by averaging predictions from multiple decision trees, each fit on a bootstrapped sample. Setting `mtry = ncol(Carseats) - 1 = 10` uses all predictors at every split — the defining characteristic of bagging versus random forests.
+
+```{r}
+#| label: bagging-tune
+
+bag_spec <- rand_forest(
+  trees = tune(),
+  mtry  = ncol(Carseats) - 1,
+  engine = 'ranger',
+  mode   = 'regression'
+)
+
+bagged_wf <- base_wf |> add_model(bag_spec)
+
+bagged_results <- tune_grid(bagged_wf,
+                            grid      = trees_grid,
+                            resamples = carseats_folds,
+                            control   = ctrl)
+
+show_best(bagged_results, metric = 'rmse')
+```
+
+```{r}
+#| label: fig-bagging-rmse
+#| fig-cap: "Mean CV RMSE versus number of trees for bagged decision trees. RMSE drops sharply from 10 to 50 trees, then stabilizes — adding more than 100 trees provides minimal further benefit."
+
+ggplot(
+  bagged_results |> collect_metrics() |> filter(.metric == 'rmse'),
+  aes(x = trees, y = mean)
+) +
+  geom_point() +
+  geom_line() +
+  labs(
+    y     = 'Mean RMSE',
+    x     = 'Number of Trees',
+    title = "RMSE Across Different Numbers of Trees: Bagged Model"
+  )
+```
+
+**Best configuration:** 100 trees, CV RMSE = **1.54**. Performance plateaus after ~100 trees, with slight fluctuations between 100–300.
+
+---
+
+## Model 2: Random Forest
+
+**Random forest** extends bagging by randomly sampling a subset of predictors at each split decision (`mtry < total predictors`). This decorrelates the individual trees, further reducing variance compared to bagging.
+
+```{r}
+#| label: rf-setup
+
+set.seed(7)
+carseats_folds <- vfold_cv(Carseats, v = 5)
+```
+
+```{r}
+#| label: rf-tune
+
+rf_spec <- rand_forest(trees = tune()) |>
+  set_engine("ranger") |>
+  set_mode("regression")
+
+rf_wf <- base_wf |> add_model(rf_spec)
+
+rf_tuned_results <- tune_grid(rf_wf,
+                              grid      = trees_grid,
+                              resamples = carseats_folds,
+                              control   = ctrl)
+
+show_best(rf_tuned_results, metric = "rmse")
+```
+
+```{r}
+#| label: fig-rf-rmse
+#| fig-cap: "Mean CV RMSE versus number of trees for random forest. Performance improves steadily through 300 trees, with the best RMSE at 100 trees."
+
+ggplot(
+  rf_tuned_results |> collect_metrics() |> filter(.metric == 'rmse'),
+  aes(x = trees, y = mean)
+) +
+  geom_point() +
+  geom_line() +
+  labs(
+    y     = 'Mean RMSE',
+    x     = 'Number of Trees',
+    title = "RMSE Across Different Numbers of Trees: Random Forest"
+  )
+```
+
+**Best configuration:** 100 trees, CV RMSE = **1.69**.
+
+> **Note on seed behavior:** `set.seed()` controls future randomness — once set and `carseats_folds` is created, that part is reproducible. However, `tune_grid()` internally consumes many random numbers, so the RNG state after bagging tuning differs from a fresh start. Re-setting the seed and recreating `carseats_folds` before each model ensures consistency.
+
+---
+
+## Model 3: Gradient Boosted Trees
+
+**Gradient boosting** builds trees sequentially — each tree is fit to the residuals of the current ensemble (XGBoost implementation). Unlike bagging/RF which average independent trees, boosting learns iteratively. With `tree_depth = 1` (decision stumps) and `learn_rate = 0.1`, the model learns slowly and steadily.
+
+```{r}
+#| label: boost-setup
+
+set.seed(7)
+carseats_folds <- vfold_cv(Carseats, v = 5)
+```
+
+```{r}
+#| label: boost-tune
+
+boost_spec <- boost_tree(
+  tree_depth = 1,
+  learn_rate = 0.1,
+  trees      = tune()
+) |>
+  set_engine("xgboost") |>
+  set_mode("regression")
+
+boost_wf <- base_wf |> add_model(boost_spec)
+
+boost_tuned_results <- tune_grid(boost_wf,
+                                 grid      = trees_grid,
+                                 resamples = carseats_folds,
+                                 control   = ctrl)
+
+show_best(boost_tuned_results, metric = 'rmse')
+```
+
+```{r}
+#| label: fig-boost-rmse
+#| fig-cap: "Mean CV RMSE versus number of trees for gradient boosting. Unlike bagging/RF, RMSE continues declining monotonically through 300 trees — suggesting even more trees may further improve performance."
+
+ggplot(
+  boost_tuned_results |> collect_metrics() |> filter(.metric == 'rmse'),
+  aes(x = trees, y = mean)
+) +
+  geom_point() +
+  geom_line() +
+  labs(
+    y     = 'Mean RMSE',
+    x     = 'Number of Trees',
+    title = "RMSE Across Different Numbers of Trees: Boosted Tree Model"
+  )
+```
+
+**Best configuration:** 300 trees, CV RMSE = **1.28**. Unlike bagging and RF which plateau, boosting continues improving — suggesting even more trees could reduce RMSE further.
+
+---
+
+## Model 4: Elastic Net (Penalized Regression)
+
+Elastic net combines L1 and L2 regularization. Despite being a linear method, it performs surprisingly well on the Carseats data — evidence of strong linear structure in the predictors.
+
+```{r}
+#| label: enet-setup
+
+set.seed(7)
+carseats_folds <- vfold_cv(Carseats, v = 5)
+```
+
+```{r}
+#| label: enet-tune
+
+grid_enet <- expand_grid(
+  penalty = seq(0, 0.1, by = 0.01),
+  mixture = c(0, 0.5, 1)
+)
+
+penalized_spec <- linear_reg(penalty = tune(), mixture = tune()) |>
+  set_engine("glmnet", path_values = seq(0, 0.1, by = 0.01))
+
+elnet_wf <- base_wf |> add_model(penalized_spec)
+
+elas <- tune_grid(elnet_wf,
+                  grid      = grid_enet,
+                  resamples = carseats_folds,
+                  control   = ctrl)
+
+show_best(elas, metric = 'rmse')
+```
+
+```{r}
+#| label: fig-enet-rmse
+#| fig-cap: "Penalized regression RMSE versus penalty strength across mixture values. Lower penalties and lasso (α=1) achieve best performance."
+
+collect_metrics(elas) |>
+  filter(.metric == 'rmse') |>
+  ggplot(aes(x = penalty, y = mean,
+             group = mixture, color = mixture)) +
+  geom_point() +
+  geom_line() +
+  labs(
+    x     = "Penalty (λ)",
+    y     = "Mean RMSE",
+    color = "Mixture (α)",
+    title = "Penalized Regression: RMSE vs Penalty"
+  )
+```
+
+**Best configuration:** penalty = 0.02, mixture = 1.0 (lasso), CV RMSE = **1.04**.
+
+> Elastic net substantially outperforms all tree-based methods — the Carseats data has strong linear structure that penalized regression exploits efficiently. Boosting is powerful on complex non-linear problems, but elastic net often excels on medium-sized, correlated datasets with linear relationships.
+
+---
+
+## Individual Model Comparison
+
+| Method | Best Configuration | CV RMSE |
+|--------|-------------------|---------|
+| Random Forest | 100 trees | 1.69 |
+| Bagged Trees | 100 trees | 1.54 |
+| Gradient Boosting | 300 trees | 1.28 |
+| **Elastic Net** | λ=0.02, α=1 | **1.04** |
+
+**Preferred individual model:** Elastic Net (RMSE = 1.04), followed by gradient boosting (1.28).
+
+---
+
+## Model Stacking: The Final Ensemble
+
+A stacked ensemble is constructed using the `stacks` package. Stacking uses a meta-learner (here, regularized linear regression) to find the optimal **weighted combination** of predictions from all candidate models. The `blend_predictions()` step applies lasso regularization to select and weight the best candidates; `fit_members()` retrains the selected members on the full training data.
+
+```{r}
+#| label: stacking
+
+ens <- stacks() |>
+  add_candidates(bagged_results) |>
+  add_candidates(rf_tuned_results) |>
+  add_candidates(boost_tuned_results) |>
+  add_candidates(elas) |>
+  blend_predictions() |>
+  fit_members()
+
+ens
+```
+
+### Stack Members and Weights
+
+The ensemble retained **5 members from 51 candidates** — all from the elastic net family. This confirms that the linear structure captured by penalized regression dominated the signal in the data; tree-based predictions added no incremental value beyond what elastic net already captured.
+
+```{r}
+#| label: stack-predictions
+
+ens_preds <- ens |>
+  predict(new_data = Carseats, members = TRUE) |>
+  bind_cols(Carseats |> select(Sales))
+
+# RMSE for ensemble and each retained member
+ens_preds |>
+  pivot_longer(cols = -Sales, names_to = "member", values_to = "prediction") |>
+  group_by(member) |>
+  rmse(truth = Sales, estimate = prediction)
+```
+
+```{r}
+#| label: ensemble-rmse
+
+ens_preds |> rmse(truth = Sales, estimate = .pred)
+```
+
+### Final Performance Summary
+
+| Model | Best Config | CV RMSE |
+|-------|------------|---------|
+| Random Forest | 100 trees | 1.69 |
+| Bagged Trees | 100 trees | 1.54 |
+| Gradient Boosting | 300 trees | 1.28 |
+| Elastic Net | λ=0.02, α=1 | 1.04 |
+| **Stacked Ensemble** | 5 elastic net members | **1.01** |
+
+The stacked ensemble achieves **RMSE = 1.01** — the best performance overall. The improvement over the best individual model (elastic net, 1.04) is modest but consistent with ensemble theory: combining complementary predictions from multiple models reduces error even when the best individual model already dominates.
+
+---
+
+## Conclusions
+
+This analysis compared four ensemble and regularized regression methods for predicting car seat sales:
+
+1. **Gradient boosting** was the best single tree-based method (RMSE = 1.28), consistently outperforming bagging (1.54) and random forest (1.69).
+2. **Elastic net** unexpectedly dominated all tree methods (RMSE = 1.04). This is because the Carseats data has strong linear structure — `ShelveLoc`, `Price`, and `CompPrice` have largely linear relationships with `Sales`.
+3. **Model stacking** provided a final marginal improvement (RMSE = 1.01) by optimally weighting elastic net variants, confirming that stacking is most beneficial when ensemble members are diverse and complementary.
+
+The sole retention of elastic net models in the stack highlights an important practical lesson: **simpler, well-regularized linear models can outperform complex non-linear methods** when the underlying data structure is predominantly linear.

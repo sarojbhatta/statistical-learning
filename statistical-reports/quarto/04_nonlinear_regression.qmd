@@ -1,0 +1,382 @@
+---
+title: "Non-Linear Regression: Wage Prediction with Splines & Polynomials"
+subtitle: "Fitting Natural Splines and Polynomial Models for Age Effects on Wage"
+author: "Saroj Bhatta"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-title: "Contents"
+    theme: cosmo
+    highlight-style: github
+    code-fold: false
+    code-tools: true
+    df-print: kable
+    fig-width: 7
+    fig-height: 5
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Overview
+
+Many real-world relationships between predictors and outcomes are non-linear. Standard linear regression cannot capture these patterns without explicit feature engineering. This report explores two flexible non-linear methods — **natural splines** and **orthogonal polynomial regression** — for modeling the relationship between `age` and `wage`, with degrees of freedom tuned via 10-fold cross-validation. Partial dependence plots are used to visualize the estimated age effect.
+
+---
+
+## Setup
+
+```{r}
+#| label: load-packages
+
+library(tidyverse)
+library(tidymodels)
+library(DALEXtra)
+library(visdat)
+```
+
+---
+
+## Dataset Overview & Missing Data
+
+The wage dataset (adapted from ISLR) contains 3,000 observations and 11 variables describing worker characteristics and earnings in the mid-Atlantic region. The prediction target is `wage` (weekly earnings in thousands of dollars).
+
+```{r}
+#| label: load-data
+
+load("data/wage.rda")
+```
+
+```{r}
+#| label: fig-visdat
+#| fig-cap: "Variable types and missing data in the wage dataset."
+
+vis_dat(wage)
+```
+
+```{r}
+#| label: fig-vismiss
+#| fig-cap: "Missing data breakdown: maritl (9%) and education (3%) have missing values."
+
+vis_miss(wage) +
+  theme(axis.text.x = element_text(hjust = 0.5))
+```
+
+```{r}
+#| label: missing-counts
+
+colSums(is.na(wage))
+```
+
+The dataset has **11 variables** and **3,000 observations**. About 1.1% of data is missing:
+
+- `maritl`: 264 missing (~9%)
+- `education`: 88 missing (~3%)
+- All other variables: complete
+
+---
+
+## Outcome Distribution
+
+The analysis predicts `wage` from `age`, `health_ins`, `jobclass`, `education`, and `race`.
+
+```{r}
+#| label: fig-wage-dist
+#| fig-cap: "Distribution of weekly wage. The right-skewed shape is consistent with wage inequality — most workers earn moderate wages with a long upper tail of high earners."
+
+ggplot(data = wage, aes(x = wage)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 30,
+                 color = 'black', fill = 'skyblue') +
+  geom_density(alpha = 0.5, fill = 'blue') +
+  labs(
+    title = "Distribution of Wage",
+    x = "Wage ($000s per week)",
+    y = "Density"
+  )
+```
+
+---
+
+## Preprocessing Recipe
+
+Missing values are handled with `step_naomit(all_predictors())`, which removes rows with missing predictor values. Since only ~3% of observations are affected (driven by `education`), complete-case analysis introduces minimal bias and avoids the complexity of imputation.
+
+```{r}
+#| label: base-recipe
+
+wage_recipe <- recipe(wage ~ age + health_ins + jobclass + education + race,
+                      data = wage) |>
+  step_naomit(all_predictors())
+```
+
+---
+
+## Natural Splines
+
+### Theory
+
+Natural splines are piecewise polynomials joined at **knots**, with two additional constraints:
+
+1. Continuity and smoothness at knot locations.
+2. **Linear behavior beyond the boundary knots** — this prevents unstable oscillations at the extremes of the data (unlike unconstrained polynomials).
+
+The **degrees of freedom** (df) parameter controls flexibility:
+
+- df = k → k−1 internal knots placed at evenly spaced quantiles of the predictor
+- Example: df = 3 → 2 internal knots at the 33.3rd and 66.7th percentiles of `age`
+
+```{r}
+#| label: spline-knot-example
+
+# For df = 3: internal knots at the 33.3% and 66.7% quantiles of age
+quantile(wage$age, probs = c(1/3, 2/3))
+```
+
+With df = 3, the knots fall at **age = 37 and age = 48**.
+
+### Tuning Degrees of Freedom via 10-Fold CV
+
+Rather than pre-specifying df, `tune()` is used inside the recipe to allow cross-validation to select the optimal value.
+
+```{r}
+#| label: spline-recipe
+
+wage_recipe <- recipe(wage ~ age + health_ins + jobclass + education + race,
+                      data = wage) |>
+  step_naomit(all_predictors()) |>
+  step_ns(age, deg_free = tune())
+```
+
+```{r}
+#| label: spline-workflow
+
+wf <- workflow() |>
+  add_recipe(wage_recipe) |>
+  add_model(linear_reg(engine = 'lm'))
+```
+
+```{r}
+#| label: spline-tune
+
+grid <- data.frame(deg_free = 1:10)
+
+set.seed(142)
+wage_folds <- vfold_cv(wage, v = 10)
+
+tuned_results <- tune_grid(wf, resamples = wage_folds, grid = grid)
+
+show_best(tuned_results, metric = "rmse")
+```
+
+The optimal degrees of freedom is **df = 6** with CV RMSE = **34.46**.
+
+### Finalizing and Fitting the Spline Model
+
+```{r}
+#| label: spline-final-fit
+
+best_param <- select_best(tuned_results, metric = 'rmse')
+
+final_wf <- wf |> finalize_workflow(best_param)
+
+final_fit <- fit(final_wf, data = wage)
+```
+
+### Partial Dependence Plot
+
+A Partial Dependence Plot (PDP) shows the **marginal effect of age on predicted wage**, averaging over all other predictor values.
+
+```{r}
+#| label: spline-pdp-setup
+
+source("ggplot_pdp.R")
+
+model_explainer <- explain_tidymodels(
+  final_fit,
+  data  = wage,
+  y     = wage$wage,
+  label = 'Linear Regression with Age Spline'
+)
+
+age_profile_pdp <- model_profile(model_explainer, variables = 'age')
+```
+
+```{r}
+#| label: fig-pdp-spline
+#| fig-cap: "Partial dependence of predicted wage on age using the natural spline model (df = 6). Wages rise steeply in early career, plateau in middle age, then decline for older workers."
+
+ggplot_pdp(age_profile_pdp, age) +
+  labs(
+    x = 'Age',
+    y = 'Average Predicted Wage',
+    title = 'Partial Dependence Profile: Natural Spline (df = 6)'
+  )
+```
+
+The PDP reveals a **non-linear, inverted-U relationship** between age and predicted wage:
+
+- Wages rise steeply from early career (~age 18) through middle age (~age 40)
+- A plateau from approximately age 40–60
+- A gradual decline for older workers (age > 60)
+
+This pattern would be completely missed by a linear model.
+
+---
+
+## Polynomial Regression
+
+As an alternative, orthogonal polynomial basis expansions of `age` are fit with degree tuned over 1–10 via 10-fold CV.
+
+### Why Natural Splines vs. Polynomials?
+
+- Polynomials force a single global function to fit all parts of the data range, which can cause **Runge's phenomenon** — extreme oscillations at the boundaries with high degrees.
+- Natural splines use local piecewise functions with boundary constraints, producing smoother and more stable fits at extreme age values.
+
+```{r}
+#| label: poly-recipe
+
+wage_recipe_poly <- recipe(wage ~ age + health_ins + jobclass + education + race,
+                           data = wage) |>
+  step_naomit(all_predictors()) |>
+  step_poly(age, degree = tune())
+
+wf_poly <- wf |> update_recipe(wage_recipe_poly)
+```
+
+```{r}
+#| label: poly-tune
+
+grid_poly <- data.frame(degree = 1:10)
+
+tuned_poly_results <- tune_grid(wf_poly,
+                                grid = grid_poly,
+                                resamples = wage_folds)
+
+show_best(tuned_poly_results, metric = 'rmse')
+```
+
+The best polynomial model uses **degree = 7** with CV RMSE = **34.47**.
+
+```{r}
+#| label: poly-final-fit
+
+best_param_poly  <- select_best(tuned_poly_results, metric = 'rmse')
+
+final_wf_poly  <- wf_poly |> finalize_workflow(best_param_poly)
+final_fit_poly <- fit(final_wf_poly, data = wage)
+```
+
+```{r}
+#| label: poly-pdp-setup
+
+model_explainer_poly <- explain_tidymodels(
+  final_fit_poly,
+  data  = wage,
+  y     = wage$wage,
+  label = 'Linear Regression with Age Polynomial'
+)
+
+age_profile_poly <- model_profile(model_explainer_poly, variables = 'age')
+```
+
+```{r}
+#| label: fig-pdp-poly
+#| fig-cap: "Partial dependence of predicted wage on age using the 7th-degree polynomial model. The overall shape mirrors the spline, but with sharper oscillations at the boundaries."
+
+ggplot_pdp(age_profile_poly, age) +
+  labs(
+    x = 'Age',
+    y = 'Average Predicted Wage',
+    title = 'Partial Dependence of Wage on Age (7th-Degree Polynomial)'
+  )
+```
+
+Both models capture a similar non-linear age-wage relationship. However, the polynomial curve shows **sharper oscillations near age 70–80**, a known characteristic of high-degree polynomials beyond the range of dense training data.
+
+---
+
+## Model Comparison: Spline vs. Polynomial
+
+| Method | Best Parameter | CV RMSE |
+|--------|---------------|---------|
+| Natural Spline | df = 6 | 34.46 |
+| Polynomial | degree = 7 | 34.47 |
+
+The natural spline is preferred:
+
+1. **Nearly identical CV RMSE** — no predictive advantage to the polynomial.
+2. **Boundary stability** — natural splines are constrained to be linear beyond the boundary knots, preventing the boundary oscillations seen in the polynomial PDP.
+3. **Interpretability** — fewer effective parameters for the same fit quality.
+
+---
+
+## Does Regularization Help? Elastic Net + Spline
+
+The optimal natural spline features were combined with elastic net regularization to test whether penalizing coefficients could further improve the model. Predictors are dummy-encoded and normalized for comparability.
+
+```{r}
+#| label: enet-recipe
+
+wage_recipe_reg <- recipe(wage ~ age + health_ins + jobclass + education + race,
+                          data = wage) |>
+  step_naomit(all_predictors()) |>
+  step_ns(age, deg_free = 6) |>           # best df from spline tuning
+  step_dummy(all_nominal_predictors()) |>
+  step_normalize(all_numeric_predictors())
+
+reg_model <- linear_reg(penalty = tune(), mixture = tune()) |>
+  set_engine("glmnet")
+
+wf_reg <- workflow() |>
+  add_recipe(wage_recipe_reg) |>
+  add_model(reg_model)
+```
+
+```{r}
+#| label: enet-tune
+
+grid_reg <- expand_grid(
+  penalty = seq(0, 3, by = 0.5),
+  mixture = seq(0, 1, by = 0.1)
+)
+
+tuned_reg_results <- tune_grid(wf_reg, resamples = wage_folds, grid = grid_reg)
+
+show_best(tuned_reg_results, metric = "rmse")
+```
+
+```{r}
+#| label: fig-enet-rmse
+#| fig-cap: "Cross-validated RMSE versus penalty strength for elastic net across mixture values. RMSE rises as regularization increases — the unpenalized spline model is already optimal."
+
+tuned_reg_results |>
+  collect_metrics() |>
+  filter(.metric == 'rmse') |>
+  ggplot(aes(x = penalty, y = mean, color = factor(mixture))) +
+  geom_point() +
+  geom_line() +
+  labs(
+    title = "Elastic Net: Cross-Validated RMSE vs Penalty (λ)",
+    x     = "Penalty (λ)",
+    y     = "Cross-Validated Mean RMSE",
+    color = "Mixture (α)"
+  )
+```
+
+The best regularized model achieves its minimum RMSE at **λ = 0** (no regularization), confirming that penalizing the spline coefficients does not improve prediction. As λ increases, RMSE consistently rises across all α values — the unpenalized natural spline model is already well-specified.
+
+---
+
+## Conclusions
+
+This analysis demonstrates the practical advantages of non-linear modeling when a predictor has a curved relationship with the outcome:
+
+1. **Non-linearity matters:** The age-wage relationship has a clear inverted-U shape that a linear model would miss entirely. Both splines and polynomials capture this effectively.
+2. **Natural splines are preferred:** The spline model (df = 6, RMSE = 34.46) is essentially equivalent to the best polynomial model (degree = 7, RMSE = 34.47), but with better boundary behavior and fewer effective parameters.
+3. **Regularization adds no value here:** The elastic net analysis confirms the spline model is not overfit — penalizing coefficients only increases prediction error.
+
+The partial dependence plots provide an intuitive, model-based summary of the age effect that is consistent with economic intuition: wages rise through early career, plateau in middle age, and decline in later years.
