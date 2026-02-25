@@ -1,0 +1,312 @@
+---
+title: "Cross-Validation for Model Selection"
+subtitle: "Evaluating Polynomial Regression Models on the Auto Dataset"
+author: "Saroj Bhatta"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-title: "Contents"
+    theme: cosmo
+    highlight-style: github
+    code-fold: false
+    code-tools: true
+    df-print: kable
+    fig-width: 7
+    fig-height: 5
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Overview
+
+Cross-validation is a resampling technique used to estimate how well a statistical model generalizes to an independent dataset. Rather than evaluating a model on the same data used to train it — which produces overly optimistic performance estimates — cross-validation holds out portions of the data to simulate out-of-sample performance.
+
+This report applies the **validation set approach** and **5-fold cross-validation** to select between three polynomial regression models for predicting fuel efficiency (`mpg`) from engine horsepower using the `Auto` dataset.
+
+---
+
+## Background: K-Fold Cross-Validation
+
+In k-fold CV, the dataset is randomly partitioned into *K* equal-sized folds. The model is trained on K−1 folds and evaluated on the held-out fold, rotating through all K folds. The final performance estimate is the average RMSE across all K iterations.
+
+**Comparison with alternatives:**
+
+- *Validation Set Approach:* Simple, but produces high-variance estimates — results depend heavily on the random split.
+- *LOOCV (Leave-One-Out CV):* Nearly unbiased, but computationally expensive and can yield high variance across iterations.
+- *K-fold CV:* Strikes a practical balance between bias, variance, and computation time.
+
+---
+
+## Setup
+
+```{r}
+#| label: load-packages
+
+library(tidyverse)
+library(tidymodels)
+library(ISLR)
+```
+
+---
+
+## Dataset Overview
+
+The `Auto` dataset from the ISLR package contains fuel efficiency and technical specifications for 392 automobiles. The outcome of interest is `mpg` (miles per gallon); the primary predictor is `horsepower`.
+
+```{r}
+#| label: explore-data
+
+glimpse(Auto)
+```
+
+```{r}
+#| label: check-missing
+
+# Confirm no missing values
+sum(is.na(Auto))
+
+# drop_na() as further confirmation
+auto_clean <- Auto |> drop_na()
+glimpse(auto_clean)
+```
+
+The dataset has **392 rows** and **9 columns** with **no missing values**, confirmed both by `sum(is.na(Auto))` returning 0 and by `drop_na()` leaving row count unchanged.
+
+---
+
+## Exploratory Analysis
+
+### Distribution of MPG
+
+```{r}
+#| label: fig-mpg-hist
+#| fig-cap: "Distribution of miles per gallon across 392 vehicles."
+
+ggplot(Auto, aes(x = mpg)) +
+  geom_histogram(bins = 30, color = 'skyblue') +
+  labs(
+    title = 'Distribution of Miles Per Gallon (MPG)',
+    x = 'MPG',
+    y = 'Count',
+    caption = "Source: Auto dataset from ISLR package"
+  )
+```
+
+```{r}
+#| label: fig-mpg-density
+#| fig-cap: "MPG distribution with overlaid kernel density estimate."
+
+ggplot(Auto, aes(x = mpg)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 30,
+                 fill = 'skyblue', color = 'black') +
+  geom_density(alpha = 0.5, fill = 'darkblue') +
+  labs(
+    title = 'Distribution of Miles Per Gallon (MPG)',
+    x = 'MPG',
+    y = 'Density',
+    caption = "Source: Auto dataset from ISLR package"
+  )
+```
+
+The distribution of MPG is right-skewed, with most vehicles between 15–30 MPG and a smaller tail of more fuel-efficient vehicles.
+
+### MPG vs. Horsepower
+
+```{r}
+#| label: fig-hp-mpg
+#| fig-cap: "Relationship between horsepower and MPG with linear regression smoother."
+
+ggplot(Auto, aes(x = horsepower, y = mpg)) +
+  geom_point(color = "blue") +
+  geom_smooth(method = "lm", formula = y ~ x, color = "darkred") +
+  labs(
+    title = "Relationship between Horsepower and MPG",
+    x = "Horsepower",
+    y = "MPG"
+  )
+
+# A loess smoother can also be added to visualize non-linearity:
+# geom_smooth(method = "loess", formula = y ~ x, se = TRUE,
+#             color = "red", linetype = "dashed")
+```
+
+The scatterplot shows a clear **negative, non-linear** relationship: higher-horsepower vehicles achieve lower fuel efficiency. The curvature suggests a polynomial model may outperform a simple linear fit.
+
+---
+
+## Validation Set Approach
+
+The data was split 75/25 into training (n = 294) and testing (n = 98) sets with a fixed seed for reproducibility. Three polynomial regression models were fit on the training data and evaluated on the test set.
+
+```{r}
+#| label: train-test-split
+
+set.seed(42)
+auto_split <- initial_split(data = Auto, prop = 3/4)
+Auto_train <- training(auto_split)
+Auto_test  <- testing(auto_split)
+
+auto_split
+```
+
+```{r}
+#| label: fit-models-validation
+
+lm_spec <- linear_reg() |> set_engine("lm")
+
+# Model 1: Linear regression
+lm1_results <- last_fit(lm_spec,
+                        mpg ~ horsepower,
+                        split = auto_split)
+lm1_results |> collect_metrics()
+```
+
+```{r}
+# Model 2: Quadratic regression
+lm2_results <- last_fit(lm_spec,
+                        mpg ~ horsepower + I(horsepower^2),
+                        split = auto_split)
+lm2_results |> collect_metrics()
+```
+
+```{r}
+# Model 3: Cubic regression
+lm3_results <- last_fit(lm_spec,
+                        mpg ~ horsepower + I(horsepower^2) + I(horsepower^3),
+                        split = auto_split)
+lm3_results |> collect_metrics()
+```
+
+### Alternative: Manual Fit and Predict
+
+These results can also be obtained by fitting and predicting separately, without `last_fit()`:
+
+```{r}
+#| label: manual-rmse
+
+lm1_fit <- fit(lm_spec, mpg ~ horsepower, data = Auto_train)
+pred1 <- lm1_fit |> predict(new_data = Auto_test) |> bind_cols(Auto_test)
+rmse1 <- pred1 |> rmse(truth = mpg, estimate = .pred)
+rmse1
+
+lm2_fit <- fit(lm_spec, mpg ~ poly(horsepower, 2), data = Auto_train)
+pred2 <- lm2_fit |> predict(new_data = Auto_test) |> bind_cols(Auto_test)
+rmse2 <- pred2 |> rmse(truth = mpg, estimate = .pred)
+rmse2
+
+lm3_fit <- fit(lm_spec, mpg ~ poly(horsepower, 3), data = Auto_train)
+pred3 <- lm3_fit |> predict(new_data = Auto_test) |> bind_cols(Auto_test)
+rmse3 <- pred3 |> rmse(truth = mpg, estimate = .pred)
+rmse3
+```
+
+### Validation Set Results Summary
+
+| Model | Formula | Test RMSE | Test R² |
+|-------|---------|-----------|---------|
+| Model 1 | mpg ~ horsepower | 5.11 | 0.617 |
+| Model 2 | mpg ~ horsepower + hp² | 4.56 | 0.700 |
+| Model 3 | mpg ~ horsepower + hp² + hp³ | 4.56 | 0.701 |
+
+Model 2 and Model 3 achieve the same test RMSE (4.56). Adding the cubic term provides no meaningful improvement. Applying the principle of **parsimony**, **Model 2 (quadratic)** is preferred.
+
+---
+
+## 5-Fold Cross-Validation
+
+To obtain more reliable performance estimates, the same three models were re-evaluated using 5-fold CV on the full dataset.
+
+```{r}
+#| label: kfold-cv
+
+set.seed(143)
+auto_cv <- vfold_cv(Auto, 5)
+auto_cv
+```
+
+```{r}
+#| label: cv-results
+
+# Model 1
+results1 <- fit_resamples(lm_spec, mpg ~ horsepower, resamples = auto_cv)
+results1 |> collect_metrics()
+```
+
+```{r}
+# Model 2
+results2 <- fit_resamples(lm_spec, mpg ~ poly(horsepower, 2), resamples = auto_cv)
+results2 |> collect_metrics()
+```
+
+```{r}
+# Model 3
+results3 <- fit_resamples(lm_spec, mpg ~ poly(horsepower, 3), resamples = auto_cv)
+results3 |> collect_metrics()
+```
+
+| Model | Mean CV RMSE | Mean CV R² |
+|-------|-------------|------------|
+| Model 1 (Linear) | 4.95 | 0.618 |
+| Model 2 (Quadratic) | 4.38 | 0.687 |
+| Model 3 (Cubic) | 4.39 | 0.686 |
+
+5-fold CV confirms the validation set findings: **Model 2 achieves the lowest CV RMSE (4.38)**. The cubic term again adds no improvement.
+
+---
+
+## Automated Tuning with `tune_grid()`
+
+Rather than manually fitting models at fixed degrees, `step_poly(horsepower, degree = tune())` within a tidymodels recipe automates the search. This step creates orthogonal polynomial basis expansions of the predictor, treating the degree as a hyperparameter to be optimized via cross-validation.
+
+```{r}
+#| label: auto-tune
+
+auto_prep <- Auto |>
+  recipe(mpg ~ horsepower) |>
+  step_poly(horsepower, degree = tune())
+
+auto_tune <- tune_grid(lm_spec, auto_prep, resamples = auto_cv)
+```
+
+```{r}
+#| label: tune-metrics
+
+auto_metrics <- auto_tune |> collect_metrics()
+auto_metrics
+```
+
+```{r}
+#| label: fig-rmse-degree
+#| fig-cap: "Mean 5-fold CV RMSE across polynomial degrees with ±1 standard error bars."
+
+auto_rmse <- auto_metrics |> filter(.metric == "rmse")
+auto_rmse
+
+ggplot(auto_rmse, aes(x = factor(degree), y = mean)) +
+  geom_line(group = 1) +
+  geom_pointrange(aes(ymin = mean - std_err, ymax = mean + std_err)) +
+  labs(
+    x = "Degree",
+    y = "Cross-validation error (RMSE)",
+    title = "Mean CV RMSE Error vs Polynomial Degree"
+  )
+```
+
+The plot confirms that **degree 2 minimizes CV error**. Degree 1 performs substantially worse; degree 3 offers only marginal and statistically insignificant improvement over degree 2. The overlapping error bars between degrees 2 and 3 reinforce that the cubic term is not justified.
+
+---
+
+## Conclusions
+
+Across both the validation set approach and 5-fold cross-validation, a **quadratic (degree-2) polynomial** of horsepower provides the best model for predicting MPG:
+
+- Test RMSE drops from **5.11** (linear) to **4.56** (quadratic)
+- CV RMSE drops from **4.95** (linear) to **4.38** (quadratic)
+- The cubic model adds no practical value — nearly identical RMSE with an extra parameter
+
+This analysis demonstrates the core benefit of cross-validation: it guards against both underfitting and overfitting by providing reliable out-of-sample performance estimates without relying on a single arbitrary data split.

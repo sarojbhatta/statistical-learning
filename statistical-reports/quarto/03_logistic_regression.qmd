@@ -1,0 +1,241 @@
+---
+title: "Logistic Regression: Predicting Stock Market Direction"
+subtitle: "Classification Analysis of S&P 500 Daily Returns using the Smarket Dataset"
+author: "Saroj Bhatta"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-title: "Contents"
+    theme: cosmo
+    highlight-style: github
+    code-fold: false
+    code-tools: true
+    df-print: kable
+    fig-width: 8
+    fig-height: 7
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Overview
+
+This analysis applies **logistic regression** to the `Smarket` dataset to investigate whether daily S&P 500 market direction (Up or Down) can be predicted from lagged percentage returns and trading volume. The report covers inference (coefficient interpretation, odds ratios, confidence intervals) and prediction (5-fold cross-validated accuracy and ROC-AUC).
+
+---
+
+## Mathematical Foundation
+
+Logistic regression models the probability of a binary outcome by transforming a linear predictor through the **logistic (sigmoid) function**:
+
+$$
+p(X) = \frac{e^{\beta_0 + \beta_1 X}}{1 + e^{\beta_0 + \beta_1 X}}
+$$
+
+Rearranging algebraically, we can derive the **log-odds (logit)** form. Starting from $p(X)$:
+
+$$
+1 - p(X) = \frac{1}{1 + e^{\beta_0 + \beta_1 X}}
+$$
+
+The odds are:
+
+$$
+\frac{p(X)}{1 - p(X)} = e^{\beta_0 + \beta_1 X}
+$$
+
+Taking the natural log:
+
+$$
+\log\left(\frac{p(X)}{1 - p(X)}\right) = \beta_0 + \beta_1 X
+$$
+
+This ensures predicted probabilities remain in [0, 1] while the log-odds relationship with predictors is linear — making the model interpretable and tractable to fit via maximum likelihood.
+
+**Example:** An individual with a 23% chance of defaulting has odds:
+$$\frac{0.23}{0.77} \approx 0.30$$
+For every ~3 non-defaults, there is approximately 1 default event.
+
+---
+
+## Setup
+
+```{r}
+#| label: load-packages
+
+library(tidyverse)
+library(tidymodels)
+library(ISLR)
+library(GGally)
+```
+
+---
+
+## Dataset Overview
+
+The `Smarket` dataset contains **1,250 daily observations** of S&P 500 percentage returns from 2001–2005. The classification target is `Direction` — whether the market closed Up or Down.
+
+```{r}
+#| label: explore-smarket
+
+glimpse(Smarket)
+```
+
+The dataset has 1,250 rows and 9 columns. Variables include: `Year`, `Lag1`–`Lag5` (percentage returns for previous 1–5 days), `Volume` (shares traded in billions), `Today` (today's return), and `Direction` (Up/Down).
+
+---
+
+## Exploratory Analysis: Variable Correlations
+
+The pairwise correlation structure of all variables was examined using `ggpairs()`. This provides simultaneous views of distributions (diagonal), scatter plots (lower triangle), and Pearson correlation coefficients (upper triangle).
+
+```{r}
+#| label: fig-ggpairs
+#| fig-cap: "Pairwise relationships in the Smarket dataset. The highest correlation is between Year and Volume (r = 0.539). Lag variables show near-zero correlations with each other and with Direction."
+#| fig-width: 10
+#| fig-height: 9
+
+ggpairs(Smarket,
+        lower = list(combo = wrap(ggally_facethist, binwidth = 0.5)),
+        progress = FALSE)
+```
+
+Key findings from the correlation matrix:
+
+- The only strong correlation is between **Year and Volume (r = 0.539)** — trading volume increased over the 2001–2005 period.
+- All Lag variables show near-zero correlations with `Direction` and with each other, suggesting limited linear predictive power.
+
+---
+
+## Logistic Regression: Full Model (Lag1–Lag5 + Volume)
+
+### Fitting and Inference
+
+```{r}
+#| label: logit-full-fit
+
+logit_fit <- logistic_reg() |>
+  set_engine("glm") |>
+  fit(Direction ~ Lag1 + Lag2 + Lag3 + Lag4 + Lag5 + Volume,
+      data = Smarket)
+
+logit_fit |> tidy(conf.int = TRUE)
+```
+
+**Interpretation of Lag1** (smallest p-value = 0.145):
+
+- **Coefficient (−0.0731):** A one-unit increase in Lag1 (previous day's return) is associated with a decrease of 0.0731 in the log-odds of the market going "Up", holding all other predictors constant.
+- **95% CI [−0.172, 0.025]:** The interval includes zero — we cannot conclude Lag1 has a real effect on Direction.
+- **p-value = 0.145:** Greater than α = 0.05; the relationship is not statistically significant.
+
+> **Note:** `levels(Smarket$Direction)` returns `[1] "Down" "Up"` — "Up" is the positive (reference) class.
+
+### Exponentiated Coefficients (Odds Ratios)
+
+```{r}
+#| label: logit-full-exponentiate
+
+logit_fit |> tidy(exponentiate = TRUE)
+```
+
+The **odds ratio for Lag1 is 0.930**: for each one-unit increase in Lag1, the odds of the market moving "Up" are multiplied by 0.93. This corresponds to a ~7% decrease in odds per unit increase in the previous day's return. Since 0.93 < 1, it indicates a slight negative association — though not statistically significant.
+
+---
+
+## Predictive Performance: Full Model via 5-Fold CV
+
+```{r}
+#| label: logit-full-cv
+
+set.seed(132)
+market_cv <- vfold_cv(Smarket, v = 5)
+
+logit_spec <- logistic_reg() |> set_engine("glm")
+
+logit_recipe <- recipe(Direction ~ Lag1 + Lag2 + Lag3 + Lag4 + Lag5 + Volume,
+                       data = Smarket)
+
+logit_workflow <- workflow() |>
+  add_model(logit_spec) |>
+  add_recipe(logit_recipe)
+
+logit_res <- fit_resamples(logit_workflow, resamples = market_cv)
+collect_metrics(logit_res)
+```
+
+The full model achieves a CV accuracy of **50.1%** and ROC-AUC of **0.502** — essentially equivalent to random guessing. This indicates that Lag1–Lag5 and Volume have no meaningful predictive power for daily market direction.
+
+---
+
+## Reduced Model: Lag1 + Lag2 Only
+
+### Fitting and Inference
+
+```{r}
+#| label: logit-reduced-fit
+
+logit_fit_2 <- logistic_reg() |>
+  set_engine("glm") |>
+  fit(Direction ~ Lag1 + Lag2,
+      data = Smarket)
+
+logit_fit_2 |> tidy(conf.int = TRUE)
+```
+
+```{r}
+#| label: logit-reduced-exponentiate
+
+logit_fit_2 |> tidy(exponentiate = TRUE)
+```
+
+**Lag1** again has the smallest p-value (0.153). Its odds ratio is **0.931**: each one-unit increase in Lag1 decreases the odds of the market going "Up" by about 7%, holding Lag2 constant. The 95% CI still includes zero, and the p-value exceeds 0.05.
+
+### Predictive Performance: Reduced Model via 5-Fold CV
+
+```{r}
+#| label: logit-reduced-cv
+
+logit_spec_2 <- logistic_reg() |> set_engine("glm")
+
+logit_recipe_2 <- recipe(Direction ~ Lag1 + Lag2, data = Smarket)
+
+logit_workflow_2 <- workflow() |>
+  add_model(logit_spec_2) |>
+  add_recipe(logit_recipe_2)
+
+logit_res_2 <- fit_resamples(logit_workflow_2, resamples = market_cv)
+collect_metrics(logit_res_2)
+```
+
+---
+
+## Model Comparison
+
+| Model | Predictors | CV Accuracy | ROC-AUC |
+|-------|-----------|-------------|---------|
+| Full model | Lag1–Lag5 + Volume | 0.501 | 0.502 |
+| Reduced model | Lag1 + Lag2 | 0.510 | 0.514 |
+
+Both models perform near random chance. The 95% CIs for accuracy overlap substantially:
+
+- Full model: 0.501 ± 1.96 × 0.0182 → **[0.465, 0.537]**
+- Reduced model: 0.510 ± 1.96 × 0.0190 → **[0.473, 0.547]**
+
+The difference is not statistically meaningful.
+
+**Preferred model:** The **reduced model (Lag1 + Lag2)** is preferred. It achieves marginally higher accuracy (51.0%) while being simpler — the extra predictors in the full model (Lag3, Lag4, Lag5, Volume) add no predictive value and introduce unnecessary complexity.
+
+---
+
+## Conclusions
+
+Logistic regression was applied to investigate whether lagged S&P 500 returns and trading volume predict daily market direction. Despite a comprehensive inferential and predictive framework, neither model achieves meaningful predictive performance.
+
+- **Inferentially:** No predictor has a statistically significant association with `Direction` at α = 0.05. Lag1 is the strongest predictor but with p = 0.145 and a CI containing zero.
+- **Predictively:** Both models achieve ~50% accuracy — indistinguishable from random guessing — and ROC-AUC ≈ 0.50 confirms near-zero discriminative ability.
+
+This finding is consistent with the **efficient market hypothesis**: if past returns reliably predicted future movements, arbitrage would quickly eliminate the pattern. The results confirm that daily market direction is largely unpredictable from the features examined here.

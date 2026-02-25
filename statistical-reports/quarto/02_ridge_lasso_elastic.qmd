@@ -1,0 +1,314 @@
+---
+title: "Ridge, Lasso & Elastic Net Regression"
+subtitle: "Regularized Regression for Geographic Music Origin Prediction"
+author: "Saroj Bhatta"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-title: "Contents"
+    theme: cosmo
+    highlight-style: github
+    code-fold: false
+    code-tools: true
+    df-print: kable
+    fig-width: 7
+    fig-height: 5
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Overview
+
+When the number of predictors is large relative to the number of observations, ordinary least squares (OLS) tends to overfit. **Regularized regression** addresses this by adding a penalty term to the OLS objective that shrinks coefficient magnitudes — trading a small increase in bias for a potentially large reduction in variance.
+
+This report compares three regularization methods — **ridge regression**, **lasso**, and **elastic net** — applied to predicting the geographic latitude of a music track's origin from 72 audio feature variables. Hyperparameters are selected via 10-fold cross-validation.
+
+---
+
+## Background
+
+| Method | Penalty | Effect |
+|--------|---------|--------|
+| **Ridge** | L2 (sum of squared coefficients) | Shrinks all coefficients toward zero; none set exactly to zero |
+| **Lasso** | L1 (sum of absolute coefficients) | Shrinks coefficients and performs variable selection (some set to exactly zero) |
+| **Elastic Net** | L1 + L2 combined | Interpolates between ridge and lasso via the `mixture` parameter (α) |
+
+The penalty strength λ controls how much shrinkage is applied. When λ = 0, all three methods reduce to OLS.
+
+---
+
+## Setup
+
+```{r}
+#| label: load-packages
+
+library(tidyverse)
+library(tidymodels)
+```
+
+---
+
+## Data & Train/Test Split
+
+The music dataset contains 500 observations and 73 variables — 72 audio features plus the outcome `lat` (latitude of music origin). The data was split 75/25 with seed 7 for reproducibility.
+
+```{r}
+#| label: load-split-data
+
+set.seed(7)
+
+music <- read_csv("data/music.csv", show_col_types = FALSE)
+
+music_split <- initial_split(music, prop = 3/4)
+music_train <- training(music_split)
+music_test  <- testing(music_split)
+
+dim(music_train)
+dim(music_test)
+```
+
+The training set has **375 observations** and 73 variables; the test set has **125 observations**.
+
+---
+
+## Exploratory Analysis: Outcome Distribution
+
+```{r}
+#| label: fig-lat-dist
+#| fig-cap: "Distribution of latitude (outcome variable) in the training set, showing the geographic spread of music origins."
+
+ggplot(data = music_train, aes(x = lat)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 30,
+                 fill = 'skyblue', color = 'blue') +
+  geom_density(fill = "lightgreen", alpha = 0.6) +
+  labs(
+    title = 'Distribution of Latitude of Music Origin',
+    x = 'Latitude',
+    y = 'Count / Density'
+  )
+```
+
+---
+
+## Baseline: Ordinary Least Squares
+
+An OLS model using all 72 predictors serves as the benchmark.
+
+```{r}
+#| label: ols-baseline
+
+lm_spec <- linear_reg() |> set_engine("lm")
+
+lm_fit <- fit(lm_spec, lat ~ ., data = music_train)
+
+preds <- lm_fit |>
+  predict(new_data = music_test) |>
+  bind_cols(music_test)
+
+rmse_ols <- preds |> rmse(truth = lat, estimate = .pred)
+rmse_ols
+```
+
+The OLS test RMSE is **17.03** — this is the benchmark to beat.
+
+---
+
+## Ridge Regression
+
+Ridge regression adds an L2 penalty: all predictors are retained but their coefficients are shrunk toward zero.
+
+### Preprocessing Recipe
+
+Predictors are dummy-encoded and scaled before fitting. Scaling is essential for ridge regression because the penalty is applied uniformly across coefficients — unscaled predictors with large magnitudes would otherwise receive disproportionate shrinkage.
+
+```{r}
+#| label: ridge-recipe
+
+music_cv <- vfold_cv(data = music_train, v = 10)
+
+reg_recipe <- recipe(lat ~ ., data = music_train) |>
+  step_dummy(all_nominal()) |>
+  step_scale(all_predictors())
+```
+
+### Tuning λ via 10-Fold CV
+
+```{r}
+#| label: ridge-tune
+
+ridge_spec <- linear_reg(penalty = tune(), mixture = 0) |>
+  set_engine("glmnet")
+
+ridge_grid <- expand_grid(penalty = seq(0, 100, by = 10))
+
+ridge_results <- tune_grid(ridge_spec,
+                           preprocessor = reg_recipe,
+                           grid = ridge_grid,
+                           resamples = music_cv)
+
+ridge_results |> collect_metrics()
+```
+
+```{r}
+#| label: ridge-best-lambda
+
+# Select lambda with lowest CV RMSE
+best_rmse <- ridge_results |> select_best(metric = "rmse")
+best_lambda <- best_rmse$penalty
+best_rmse
+```
+
+```{r}
+#| label: ridge-rmse-sorted
+
+ridge_results |>
+  collect_metrics() |>
+  filter(.metric == "rmse") |>
+  arrange(mean)
+```
+
+### Final Ridge Model on Test Set
+
+```{r}
+#| label: ridge-final-fit
+
+final_reg_spec <- linear_reg(penalty = best_lambda, mixture = 0) |>
+  set_engine("glmnet")
+
+ridge_wf <- workflow() |>
+  add_model(final_reg_spec) |>
+  add_recipe(reg_recipe)
+
+ridge_fit <- last_fit(ridge_wf, split = music_split)
+ridge_fit |> collect_metrics()
+```
+
+The optimal λ selected by 10-fold CV is **λ = 10**, yielding a CV RMSE of ~17.06 and a test RMSE of **16.54** — an improvement over the OLS baseline of 17.03.
+
+### Variable Coefficients in Ridge
+
+In ridge regression, all 72 predictors are retained. Coefficients are shrunk toward zero but none are set exactly to zero.
+
+```{r}
+#| label: ridge-coefficients
+
+# Fit final ridge model to full training data
+final_fit <- workflow() |>
+  add_recipe(reg_recipe) |>
+  add_model(final_reg_spec) |>
+  fit(data = music_train)
+
+final_fit |>
+  tidy() |>
+  filter(term != "(Intercept)") |>
+  arrange(desc(abs(estimate)))
+```
+
+---
+
+## Lasso Regression
+
+Lasso uses an L1 penalty, which has the geometric property of setting some coefficients to exactly zero — performing automatic **variable selection**. The specification is identical to ridge but with `mixture = 1`.
+
+```{r}
+#| label: lasso-tune
+
+lasso_spec <- linear_reg(penalty = tune(), mixture = 1) |>
+  set_engine("glmnet")
+
+lasso_results <- tune_grid(lasso_spec,
+                           preprocessor = reg_recipe,
+                           grid = ridge_grid,
+                           resamples = music_cv)
+
+best_lasso <- lasso_results |> select_best(metric = "rmse")
+best_lasso
+```
+
+```{r}
+#| label: lasso-final
+
+final_lasso_spec <- linear_reg(penalty = best_lasso$penalty, mixture = 1) |>
+  set_engine("glmnet")
+
+lasso_wf <- workflow() |>
+  add_model(final_lasso_spec) |>
+  add_recipe(reg_recipe)
+
+lasso_fit <- last_fit(lasso_wf, split = music_split)
+lasso_fit |> collect_metrics()
+```
+
+---
+
+## Elastic Net
+
+Elastic net combines L1 and L2 penalties. The `mixture` parameter α interpolates between pure ridge (α = 0) and pure lasso (α = 1). Both `penalty` and `mixture` are tuned jointly.
+
+```{r}
+#| label: elastic-net-tune
+
+enet_spec <- linear_reg(penalty = tune(), mixture = tune()) |>
+  set_engine("glmnet")
+
+enet_grid <- expand_grid(
+  penalty  = seq(0, 100, by = 10),
+  mixture  = c(0, 0.25, 0.5, 0.75, 1)
+)
+
+enet_results <- tune_grid(enet_spec,
+                          preprocessor = reg_recipe,
+                          grid = enet_grid,
+                          resamples = music_cv)
+
+enet_results |>
+  collect_metrics() |>
+  filter(.metric == "rmse") |>
+  arrange(mean) |>
+  head(10)
+```
+
+```{r}
+#| label: enet-final
+
+best_enet <- enet_results |> select_best(metric = "rmse")
+
+final_enet_spec <- linear_reg(penalty = best_enet$penalty,
+                              mixture = best_enet$mixture) |>
+  set_engine("glmnet")
+
+enet_wf <- workflow() |>
+  add_model(final_enet_spec) |>
+  add_recipe(reg_recipe)
+
+enet_fit <- last_fit(enet_wf, split = music_split)
+enet_fit |> collect_metrics()
+```
+
+---
+
+## Model Comparison
+
+| Method | Optimal λ | Mixture (α) | CV RMSE | Test RMSE |
+|--------|-----------|-------------|---------|-----------|
+| OLS (baseline) | — | — | — | 17.03 |
+| Ridge | 10 | 0 (L2) | ~17.06 | 16.54 |
+| Lasso | (tuned) | 1 (L1) | (see output) | (see output) |
+| Elastic Net | (tuned) | (tuned) | (see output) | (see output) |
+
+---
+
+## Conclusions
+
+All three regularization methods address overfitting in high-dimensional settings by penalizing coefficient magnitudes. For this music dataset:
+
+- **Ridge regression** (λ = 10) improved on OLS, reducing test RMSE from 17.03 to 16.54. This demonstrates that even mild shrinkage helps when there are 72 predictors and 375 training observations.
+- **Lasso** performs automatic variable selection, producing a sparse model where many audio features are zeroed out — useful for interpretability.
+- **Elastic net** provides flexibility to balance both behaviors via the mixture parameter.
+
+The key practical distinction: if **interpretability and feature selection** matter, lasso is preferred. If **predictive stability** with correlated predictors is the priority, ridge or elastic net are better choices.
